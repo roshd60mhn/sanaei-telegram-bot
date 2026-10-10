@@ -1,3 +1,4 @@
+import database as database_module
 import asyncio
 import logging
 
@@ -47,11 +48,14 @@ from database import (
     set_plan_status,
     delete_plan,
     get_setting,
+    get_user,
+    claim_start_notification,
     set_setting,
     set_telegram_username,
     disable_user_services,
     delete_user_services,
     get_users_with_services,
+    get_all_users_paginated,
 )
 from sanaei import SanaeiAPI
 
@@ -79,6 +83,16 @@ sanaei = SanaeiAPI()
 # FSM
 # =========================================================
 
+class AttachServiceStates(StatesGroup):
+    waiting_telegram_id = State()
+    waiting_name = State()
+    waiting_port = State()
+    waiting_address = State()
+    waiting_destination_port = State()
+    waiting_volume = State()
+    waiting_confirmation = State()
+
+
 class ServiceStates(StatesGroup):
     waiting_name = State()
     waiting_port = State()
@@ -99,6 +113,11 @@ class PlanStates(StatesGroup):
 class SettingsStates(StatesGroup):
     waiting_support = State()
     waiting_help = State()
+
+
+class BroadcastStates(StatesGroup):
+    waiting_message = State()
+    waiting_confirmation = State()
 
 
 # =========================================================
@@ -129,7 +148,7 @@ async def user_reply_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
-        is_persistent=True,
+        is_persistent=False,
     )
 async def admin_reply_keyboard():
     keyboard = [
@@ -148,13 +167,14 @@ async def admin_reply_keyboard():
         ],
         [
             KeyboardButton(text="⚙️ مدیریت"),
+            KeyboardButton(text="🔽 بستن منو"),
         ],
     ]
 
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
-        is_persistent=True,
+        is_persistent=False,
     )
 
 async def main_keyboard(user_id: int | None = None):
@@ -417,21 +437,59 @@ async def get_inbound_usage(port: int):
 # START
 # =========================================================
 
+
+async def get_all_registered_telegram_ids() -> list[int]:
+    import aiosqlite
+
+    async with aiosqlite.connect(config.db_path) as db:
+        cursor = await db.execute(
+            "SELECT telegram_id FROM users ORDER BY telegram_id"
+        )
+        rows = await cursor.fetchall()
+        return [int(row[0]) for row in rows]
+
+
 @dp.message(Command("start"))
 async def start_handler(message: Message):
+    user = message.from_user
+
     await set_telegram_username(
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.first_name,
-        message.from_user.last_name,
+        user.id,
+        user.username,
+        user.first_name,
+        user.last_name,
     )
+
+    should_notify = await claim_start_notification(user.id)
+
+    if should_notify:
+        full_name = " ".join(
+            part for part in (user.first_name, user.last_name) if part
+        ) or "ندارد"
+        username = f"@{user.username}" if user.username else "ندارد"
+        notice = (
+            "🎉 یک کاربر جدید ربات را استارت کرد\n\n"
+            f"نام : {full_name}\n"
+            f"نام کاربری : {username}\n"
+            f"آیدی عددی : {user.id}"
+        )
+
+        for admin_id in config.admin_ids:
+            try:
+                await bot.send_message(admin_id, notice)
+            except Exception:
+                logger.exception(
+                    "Could not notify admin %s about user %s",
+                    admin_id,
+                    user.id,
+                )
 
     text = (
         "👋 <b>خوش آمدید</b>\n\n"
         "از منوی زیر می‌توانید سرویس خود را خریداری و مدیریت کنید."
     )
 
-    if is_admin(message.from_user.id):
+    if is_admin(user.id):
         keyboard = await admin_reply_keyboard()
     else:
         keyboard = await user_reply_keyboard()
@@ -1612,18 +1670,6 @@ async def close_menu_handler(message: Message):
         reply_markup=ReplyKeyboardRemove(),
     )
 
-async def reply_menu_handler(message: Message):
-    if is_admin(message.from_user.id):
-        await message.answer(
-            "⚙️ منوی مدیریت:",
-            reply_markup=await admin_reply_keyboard(),
-        )
-    else:
-        await message.answer(
-            "⌨️ منوی اصلی:",
-            reply_markup=await user_reply_keyboard(),
-        )
-
 
 @dp.message(F.text == "ℹ️ راهنما")
 async def reply_help_handler(message: Message):
@@ -1688,9 +1734,330 @@ async def reply_admin_handler(message: Message):
                         callback_data="admin:help",
                     ),
                 ],
+                [
+                    InlineKeyboardButton(
+                        text="🔗 اتصال سرویس موجود",
+                        callback_data="admin:attach_service",
+                    ),
+                    InlineKeyboardButton(
+                        text="📣 پیام همگانی",
+                        callback_data="admin:broadcast",
+                    ),
+                ],
             ]
         ),
     )
+
+# =========================================================
+# =========================================================
+# ADMIN: ATTACH AN EXISTING PANEL SERVICE (NO PANEL CREATION)
+# =========================================================
+
+@dp.callback_query(F.data == "admin:attach_service")
+async def attach_existing_service_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(AttachServiceStates.waiting_telegram_id)
+    await callback.answer()
+    await callback.message.answer(
+        "🔗 اتصال سرویس موجود به کاربر\n\n"
+        "آیدی عددی تلگرام کاربر را بفرست.\n"
+        "برای لغو، /cancel را ارسال کن."
+    )
+
+
+@dp.message(AttachServiceStates.waiting_telegram_id)
+async def attach_existing_user_id(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        telegram_id = int(message.text.strip())
+        if telegram_id <= 0:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await message.answer("آیدی باید یک عدد صحیح مثبت باشد.")
+        return
+
+    await state.update_data(telegram_id=telegram_id)
+    await state.set_state(AttachServiceStates.waiting_name)
+    await message.answer("نام سرویس را وارد کن:")
+
+
+@dp.message(AttachServiceStates.waiting_name)
+async def attach_existing_name(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    name = (message.text or "").strip()
+    if not name or len(name) > 100:
+        await message.answer("نام سرویس معتبر نیست؛ دوباره وارد کن.")
+        return
+    await state.update_data(name=name)
+    await state.set_state(AttachServiceStates.waiting_port)
+    await message.answer(
+        "پورت ورودیِ اینباند موجود در پنل Sanaei را وارد کن "
+        "(نه پورت مقصد):"
+    )
+
+
+@dp.message(AttachServiceStates.waiting_port)
+async def attach_existing_port(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        port = int(message.text.strip())
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await message.answer("پورت باید عددی بین 1 تا 65535 باشد.")
+        return
+
+    await state.update_data(port=port)
+    await state.set_state(AttachServiceStates.waiting_address)
+    await message.answer("IP یا آدرس مقصد سرویس را وارد کن:")
+
+
+@dp.message(AttachServiceStates.waiting_address)
+async def attach_existing_address(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    address = (message.text or "").strip()
+    if not address or len(address) > 255:
+        await message.answer("آدرس مقصد معتبر نیست؛ دوباره وارد کن.")
+        return
+    await state.update_data(rewrite_address=address)
+    await state.set_state(AttachServiceStates.waiting_destination_port)
+    await message.answer("پورت مقصد را وارد کن:")
+
+
+@dp.message(AttachServiceStates.waiting_destination_port)
+async def attach_existing_destination_port(
+    message: Message, state: FSMContext
+):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        destination_port = int(message.text.strip())
+        if not 1 <= destination_port <= 65535:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await message.answer("پورت مقصد باید عددی بین 1 تا 65535 باشد.")
+        return
+
+    await state.update_data(rewrite_port=destination_port)
+    await state.set_state(AttachServiceStates.waiting_volume)
+    await message.answer("حجم سرویس را بر حسب گیگابایت وارد کن:")
+
+
+@dp.message(AttachServiceStates.waiting_volume)
+async def attach_existing_volume(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        plan_gb = int(message.text.strip())
+        if not 1 <= plan_gb <= 100000:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await message.answer("حجم باید عددی بین 1 تا 100000 گیگابایت باشد.")
+        return
+
+    await state.update_data(plan_gb=plan_gb)
+    data = await state.get_data()
+    await state.set_state(AttachServiceStates.waiting_confirmation)
+    await message.answer(
+        "لطفاً اطلاعات را بررسی کن:\n\n"
+        f"👤 آیدی تلگرام: <code>{data['telegram_id']}</code>\n"
+        f"📦 نام: <code>{data['name']}</code>\n"
+        f"🔌 پورت ورودی موجود: <code>{data['port']}</code>\n"
+        f"🎯 مقصد: <code>{data['rewrite_address']}:{data['rewrite_port']}</code>\n"
+        f"📊 حجم نمایشی: <b>{data['plan_gb']}GB</b>\n\n"
+        "برای ثبت فقط در دیتابیس ربات، «تأیید» را بفرست.\n"
+        "هیچ اینباندی در پنل ساخته نمی‌شود."
+    )
+
+
+@dp.message(AttachServiceStates.waiting_confirmation)
+async def attach_existing_confirmation(
+    message: Message, state: FSMContext
+):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    answer = (message.text or "").strip().lower()
+    if answer not in ("تایید", "تأیید", "yes", "ok"):
+        await message.answer("برای ثبت «تأیید» یا برای لغو /cancel را بفرست.")
+        return
+
+    data = await state.get_data()
+    await message.answer("🔎 در حال بررسی اینباند موجود در پنل...")
+
+    try:
+        # Read-only lookup: do not call create_tunnel or any panel write API.
+        inbound = await sanaei.find_inbound_by_port(int(data["port"]))
+        if not inbound:
+            await message.answer(
+                "❌ این پورت در اینباندهای فعلی پنل پیدا نشد. "
+                "هیچ چیزی ثبت نشده؛ پورت ورودی را بررسی کن."
+            )
+            return
+
+        try:
+            inbound_id = int(inbound.get("id") or inbound.get("_id") or 0)
+        except (TypeError, ValueError):
+            inbound_id = 0
+
+        if inbound_id <= 0:
+            await message.answer(
+                "❌ اینباند پیدا شد، اما شناسه معتبر ندارد. "
+                "هیچ چیزی ثبت نشده است."
+            )
+            return
+
+        service_id = await database_module.create_manual_service(
+            telegram_id=int(data["telegram_id"]),
+            inbound_id=inbound_id,
+            name=data["name"],
+            port=int(data["port"]),
+            rewrite_address=data["rewrite_address"],
+            rewrite_port=int(data["rewrite_port"]),
+            plan_gb=int(data["plan_gb"]),
+        )
+    except Exception:
+        await message.answer(
+            "❌ ثبت انجام نشد. احتمالاً پورت قبلاً در دیتابیس ربات ثبت شده "
+            "یا خطای دیتابیس رخ داده است. لاگ ربات را بررسی کن."
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        "✅ سرویس موجود به کاربر متصل شد.\n"
+        f"شناسه سرویس در ربات: <code>{service_id}</code>\n"
+        f"آیدی تلگرام کاربر: <code>{data['telegram_id']}</code>\n\n"
+        "در این عملیات هیچ اینباندی در پنل ساخته یا تغییر داده نشد."
+    )
+
+
+@dp.message(StateFilter(AttachServiceStates), F.text == "/cancel")
+async def attach_existing_cancel(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    await state.clear()
+    await message.answer("عملیات اتصال سرویس لغو شد.")
+
+
+# ADMIN BROADCAST
+# =========================================================
+
+@dp.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+
+    await state.set_state(BroadcastStates.waiting_message)
+    await callback.message.answer(
+        "📣 پیام متنی موردنظر را ارسال کنید.\n"
+        "برای لغو، /cancel را بفرستید."
+    )
+    await callback.answer()
+
+
+@dp.message(BroadcastStates.waiting_message)
+async def admin_broadcast_receive(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("ارسال همگانی لغو شد.")
+        return
+
+    if not message.text or not message.text.strip():
+        await message.answer("لطفاً یک پیام متنی ارسال کنید یا /cancel بزنید.")
+        return
+
+    await state.update_data(broadcast_text=message.text)
+    await state.set_state(BroadcastStates.waiting_confirmation)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ تأیید و ارسال", callback_data="admin:broadcast:confirm"),
+            InlineKeyboardButton(text="❌ لغو", callback_data="admin:broadcast:cancel"),
+        ]
+    ])
+    await message.answer(
+        "پیش‌نمایش پیام همگانی:\n\n"
+        f"{message.text}\n\n"
+        "آیا برای ارسال به همهٔ کاربران ثبت‌شده تأیید می‌کنید؟",
+        reply_markup=keyboard,
+    )
+
+
+@dp.callback_query(F.data == "admin:broadcast:cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("ارسال همگانی لغو شد.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin:broadcast:confirm")
+async def admin_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    broadcast_text = data.get("broadcast_text")
+    if not broadcast_text:
+        await state.clear()
+        await callback.answer("پیام پیدا نشد؛ دوباره شروع کنید.", show_alert=True)
+        return
+
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("⏳ ارسال پیام همگانی شروع شد...")
+
+    user_ids = await get_all_registered_telegram_ids()
+    sent = 0
+    failed = 0
+
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, broadcast_text)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.exception("Broadcast failed for Telegram user %s", user_id)
+        await asyncio.sleep(0.05)
+
+    await callback.message.answer(
+        "📊 <b>گزارش پیام همگانی</b>\n\n"
+        f"👥 کل کاربران: {len(user_ids)}\n"
+        f"✅ ارسال موفق: {sent}\n"
+        f"❌ ناموفق: {failed}"
+    )
+    await callback.answer("ارسال پایان یافت.")
+
 
 # =========================================================
 # SERVICE RENEW
@@ -1895,93 +2262,139 @@ async def admin_handler(message: Message):
 # ADMIN USERS
 # =========================================================
 
-@dp.callback_query(F.data == "admin:users")
-async def admin_users_handler(
-    callback: CallbackQuery,
+async def render_admin_users_page(
+    message,
+    page: int = 0,
+    edit: bool = True,
 ):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "دسترسی ندارید",
-            show_alert=True,
+    page_size = 8
+    rows, total = await get_all_users_paginated(
+        limit=page_size,
+        offset=page * page_size,
+    )
+
+    if total == 0:
+        text = "👥 هنوز کاربری ثبت نشده است."
+        markup = admin_keyboard()
+    else:
+        total_pages = (total + page_size - 1) // page_size
+        text = (
+            f"👥 <b>فهرست کاربران</b>\n"
+            f"تعداد کل: <b>{total}</b> | صفحه <b>{page + 1}/{total_pages}</b>\n\n"
         )
-        return
 
-    rows = await get_users_with_services()
-
-    if not rows:
-        await callback.message.edit_text(
-            "👥 هنوز کاربری ثبت نشده است.",
-            reply_markup=admin_keyboard(),
-        )
-        await callback.answer()
-        return
-
-    users = {}
-
-    for row in rows:
-        telegram_id = row["telegram_id"]
-
-        if telegram_id not in users:
-            users[telegram_id] = {
-                "username": row["telegram_username"],
-                "services": [],
+        try:
+            inbound_items = await sanaei.inbounds()
+            inbound_map = {
+                int(item["id"]): item
+                for item in inbound_items
+                if item.get("id") is not None
             }
+        except Exception:
+            logging.exception("Could not load inbounds for admin user list")
+            inbound_map = {}
 
-        if row["service_id"]:
-            users[telegram_id]["services"].append(row)
+        for row in rows:
+            telegram_id = row["telegram_id"]
+            username = row["telegram_username"]
+            username_text = f"@{username}" if username else "ندارد"
+            created_at = row["created_at"] or "نامشخص"
 
-    text = "👥 <b>کاربران و سرویس‌ها</b>\n\n"
+            services = await get_user_services(telegram_id)
+            services = [
+                service for service in services
+                if service["status"] != "deleted"
+            ]
 
-    for telegram_id, user in users.items():
-        username = user["username"]
+            text += (
+                f"👤 <b>{username_text}</b>\n"
+                f"🆔 آیدی: <code>{telegram_id}</code>\n"
+                f"📅 ثبت‌نام: <code>{created_at}</code>\n"
+                f"📦 تعداد سرویس‌ها: <b>{len(services)}</b>\n"
+            )
 
-        if username:
-            username_text = f"@{username}"
-        else:
-            username_text = "ندارد"
-
-        text += (
-            f"👤 <b>{username_text}</b>\n"
-            f"🆔 آیدی عددی: <code>{telegram_id}</code>\n"
-        )
-
-        text += (
-            f"🔴 خاموش کردن همه سرویس‌ها: "
-            f"/disable_user_{telegram_id}\n"
-            f"🗑️ حذف همه سرویس‌ها: "
-            f"/delete_user_{telegram_id}\n"
-        )
-
-        if user["services"]:
-            text += "📦 سرویس‌ها:\n"
-
-            for service in user["services"]:
-                status_map = {
-                    "active": "🟢",
-                    "disabled": "🔴",
-                }
-
-                status = status_map.get(
-                    service["status"],
-                    "⚫",
+            for service in services:
+                inbound = inbound_map.get(service["inbound_id"])
+                inbound_name = (
+                    inbound.get("remark") if inbound else None
+                ) or service["name"]
+                inbound_port = (
+                    inbound.get("port") if inbound else None
+                ) or service["port"]
+                status_text = (
+                    "🟢 فعال" if service["status"] == "active"
+                    else "🔴 غیرفعال"
                 )
 
                 text += (
-                    f"   {status} "
-                    f"🔌 پورت: <code>{service['port']}</code> "
-                    f"— {service['plan_gb']}GB\n"
+                    f"   • <b>{service['name']}</b> — {status_text}\n"
+                    f"     🖥 نام اینباند: <code>{inbound_name}</code>\n"
+                    f"     🔌 پورت: <code>{inbound_port}</code>\n"
                 )
-        else:
-            text += "📦 سرویس: ندارد\n"
 
-        text += "\n"
+            text += (
+                f"🔴 خاموش‌کردن: /disable_user_{telegram_id}\n"
+                f"🗑 حذف: /delete_user_{telegram_id}\n\n"
+            )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_keyboard(),
-    )
+        buttons = []
+        if page > 0:
+            buttons.append(
+                InlineKeyboardButton(
+                    text="⬅️ صفحه قبل",
+                    callback_data=f"admin:users:page:{page - 1}",
+                )
+            )
+        if (page + 1) * page_size < total:
+            buttons.append(
+                InlineKeyboardButton(
+                    text="صفحه بعد ➡️",
+                    callback_data=f"admin:users:page:{page + 1}",
+                )
+            )
 
+        keyboard_rows = [buttons] if buttons else []
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text="🔙 بازگشت به مدیریت",
+                callback_data="admin:menu",
+            )
+        ])
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+    if edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data == "admin:users")
+async def admin_users_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید", show_alert=True)
+        return
+
+    await render_admin_users_page(callback.message, page=0)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:users:page:"))
+async def admin_users_page_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید", show_alert=True)
+        return
+
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+        if page < 0:
+            raise ValueError
+    except (ValueError, IndexError):
+        await callback.answer("شماره صفحه نامعتبر است.", show_alert=True)
+        return
+
+    await render_admin_users_page(callback.message, page=page)
+    await callback.answer()
+
 
 @dp.message(F.text.startswith("/disable_user_"))
 async def disable_user_handler(message: Message):

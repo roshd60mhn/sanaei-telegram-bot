@@ -7,6 +7,14 @@ async def init_db():
     async with aiosqlite.connect(config.db_path) as db:
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS start_notifications (
+                telegram_id INTEGER PRIMARY KEY,
+                notified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
                 client_email TEXT,
@@ -484,6 +492,51 @@ async def create_renewal_order(
 # SERVICES
 # =========================================================
 
+async def create_manual_service(
+    telegram_id: int,
+    inbound_id: int,
+    name: str,
+    port: int,
+    rewrite_address: str,
+    rewrite_port: int,
+    plan_gb: int,
+):
+    """Register an already-existing panel inbound in the bot database only."""
+    async with aiosqlite.connect(config.db_path) as db:
+        try:
+            await db.execute("BEGIN")
+
+            order_cursor = await db.execute("""
+                INSERT INTO orders (
+                    telegram_id, plan_gb, amount, status, approved_at
+                )
+                VALUES (?, ?, 0, 'service_created', CURRENT_TIMESTAMP)
+            """, (telegram_id, plan_gb))
+            order_id = order_cursor.lastrowid
+
+            service_cursor = await db.execute("""
+                INSERT INTO services (
+                    order_id, telegram_id, inbound_id, name, port,
+                    rewrite_address, rewrite_port, plan_gb, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            """, (
+                order_id, telegram_id, inbound_id, name, port,
+                rewrite_address, rewrite_port, plan_gb
+            ))
+            service_id = service_cursor.lastrowid
+
+            await db.execute(
+                "UPDATE orders SET service_id = ? WHERE id = ?",
+                (service_id, order_id),
+            )
+            await db.commit()
+            return service_id
+        except Exception:
+            await db.rollback()
+            raise
+
+
 async def create_service(
     order_id: int,
     telegram_id: int,
@@ -872,3 +925,63 @@ async def delete_user_services(telegram_id: int):
             WHERE telegram_id = ?
         """, (telegram_id,))
         await db.commit()
+
+
+async def claim_start_notification(telegram_id: int) -> bool:
+    """Return True only the first time this Telegram user claims a notification."""
+    async with aiosqlite.connect(config.db_path) as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO start_notifications (telegram_id) VALUES (?)",
+            (telegram_id,),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def get_all_users_paginated(limit: int = 8, offset: int = 0):
+    async with aiosqlite.connect(config.db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute("""
+            WITH all_user_ids AS (
+                SELECT telegram_id FROM users
+                UNION
+                SELECT telegram_id FROM services WHERE status != 'deleted'
+            )
+            SELECT
+                ids.telegram_id,
+                u.telegram_username,
+                u.created_at,
+                COUNT(
+                    CASE
+                        WHEN s.status != 'deleted' THEN s.id
+                    END
+                ) AS service_count
+            FROM all_user_ids AS ids
+            LEFT JOIN users AS u
+                ON u.telegram_id = ids.telegram_id
+            LEFT JOIN services AS s
+                ON s.telegram_id = ids.telegram_id
+            GROUP BY
+                ids.telegram_id,
+                u.telegram_username,
+                u.created_at
+            ORDER BY
+                CASE WHEN u.created_at IS NULL THEN 1 ELSE 0 END,
+                u.created_at DESC,
+                ids.telegram_id DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+
+        rows = await cursor.fetchall()
+
+        cursor = await db.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT telegram_id FROM users
+                UNION
+                SELECT telegram_id FROM services WHERE status != 'deleted'
+            )
+        """)
+        total = (await cursor.fetchone())[0]
+
+        return rows, total
