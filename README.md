@@ -35,8 +35,7 @@
 برای دریافت و اجرای اسکریپت نصب، دستور زیر را در ترمینال سرور اجرا کنید:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roshd60mhn/sanaei-telegram-bot/main/install.sh | sudo bash
-```
+bash <(curl -fsSL https://raw.githubusercontent.com/roshd60mhn/sanaei-telegram-bot/main/install-menu.sh)```
 
 **نکته امنیتی:** پیش از اجرای اسکریپت با دسترسی `sudo`، بهتر است محتوای آن را بررسی کنید.
 
